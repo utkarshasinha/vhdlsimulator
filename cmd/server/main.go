@@ -452,15 +452,19 @@ func simulateHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "code exceeds maximum allowed size"})
 		return
 	}
+	if len(req.Testbench) > maxSimulationCodeSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "testbench exceeds maximum allowed size"})
+		return
+	}
 
-	result := runSimulation(req.Code, req.Language, req.EntityName)
+	result := runSimulation(req.Code, req.Testbench, req.Language, req.EntityName)
 
 	c.JSON(http.StatusOK, result)
 }
 
 // ============== SIMULATOR ==============
 
-func runSimulation(code, language, entityName string) SimulationResult {
+func runSimulation(code, testbench, language, entityName string) SimulationResult {
 	tempDir, err := os.MkdirTemp("", "vhdl-sim-*")
 	if err != nil {
 		return SimulationResult{
@@ -484,6 +488,22 @@ func runSimulation(code, language, entityName string) SimulationResult {
 		}
 	}
 
+	var testbenchFile string
+	if strings.TrimSpace(testbench) != "" {
+		if strings.ToUpper(language) == "VERILOG" {
+			testbenchFile = filepath.Join(tempDir, "testbench.v")
+		} else {
+			testbenchFile = filepath.Join(tempDir, "testbench.vhd")
+		}
+
+		if err = os.WriteFile(testbenchFile, []byte(testbench), 0644); err != nil {
+			return SimulationResult{
+				Success: false,
+				Error:   "Failed to write testbench file: " + err.Error(),
+			}
+		}
+	}
+
 	var output strings.Builder
 
 	if strings.ToUpper(language) == "VHDL" {
@@ -503,8 +523,30 @@ func runSimulation(code, language, entityName string) SimulationResult {
 			}
 		}
 
+		if testbenchFile != "" {
+			stepCtx, cancel = context.WithTimeout(context.Background(), simulationStepTimeout)
+			testbenchAnalyzeCmd := exec.CommandContext(stepCtx, "ghdl", "-a", testbenchFile)
+			testbenchAnalyzeCmd.Dir = tempDir
+			testbenchAnalyzeOutput, tbErr := testbenchAnalyzeCmd.CombinedOutput()
+			cancel()
+			output.WriteString("\n=== Testbench Analysis ===\n")
+			output.Write(testbenchAnalyzeOutput)
+
+			if tbErr != nil {
+				return SimulationResult{
+					Success: false,
+					Output:  output.String(),
+					Error:   string(testbenchAnalyzeOutput),
+				}
+			}
+		}
+
 		if entityName == "" {
-			entityName = extractEntityName(code)
+			if testbenchFile != "" {
+				entityName = extractEntityName(testbench)
+			} else {
+				entityName = extractEntityName(code)
+			}
 		}
 
 		stepCtx, cancel = context.WithTimeout(context.Background(), simulationStepTimeout)
@@ -555,8 +597,13 @@ func runSimulation(code, language, entityName string) SimulationResult {
 	} else {
 		vvpFile := filepath.Join(tempDir, "output.vvp")
 
+		compileArgs := []string{"-o", vvpFile, designFile}
+		if testbenchFile != "" {
+			compileArgs = append(compileArgs, testbenchFile)
+		}
+
 		stepCtx, cancel := context.WithTimeout(context.Background(), simulationStepTimeout)
-		compileCmd := exec.CommandContext(stepCtx, "iverilog", "-o", vvpFile, designFile)
+		compileCmd := exec.CommandContext(stepCtx, "iverilog", compileArgs...)
 		compileCmd.Dir = tempDir
 		compileOutput, err := compileCmd.CombinedOutput()
 		cancel()

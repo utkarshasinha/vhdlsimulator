@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"errors"
+	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"vhdl-platform/internal/database"
@@ -13,8 +15,17 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// JWT secret key (change in production!)
-var jwtSecret = []byte("vhdl_share_super_secret_key_2026")
+// JWT secret key loaded from environment.
+var jwtSecret []byte
+
+func init() {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = "dev_only_insecure_change_me"
+		log.Println("⚠️ JWT_SECRET is not set; using insecure development fallback")
+	}
+	jwtSecret = []byte(secret)
+}
 
 // Claims structure for JWT
 type Claims struct {

@@ -69,15 +69,20 @@ func main() {
 	}
 
 	r := gin.Default()
+	allowedOrigins := getAllowedOrigins()
 
 	// ✅ CORS Middleware
 	r.Use(func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
 		if origin != "" {
+			if _, ok := allowedOrigins[origin]; !ok {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Origin not allowed"})
+				return
+			}
 			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
 			c.Writer.Header().Set("Vary", "Origin")
+			c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 
@@ -139,6 +144,34 @@ func getDatabaseStatus() string {
 		return "connected"
 	}
 	return "disconnected"
+}
+
+func getAllowedOrigins() map[string]struct{} {
+	allowedOrigins := map[string]struct{}{}
+
+	origins := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	if origins == "" {
+		defaults := []string{
+			"http://localhost:5173",
+			"http://127.0.0.1:5173",
+			"http://localhost:3000",
+			"http://127.0.0.1:3000",
+		}
+		for _, origin := range defaults {
+			allowedOrigins[origin] = struct{}{}
+		}
+		log.Println("⚠️ CORS_ALLOWED_ORIGINS not set; using local development defaults")
+		return allowedOrigins
+	}
+
+	for _, origin := range strings.Split(origins, ",") {
+		trimmed := strings.TrimSpace(origin)
+		if trimmed != "" {
+			allowedOrigins[trimmed] = struct{}{}
+		}
+	}
+
+	return allowedOrigins
 }
 
 // ============== DESIGN HANDLERS ==============

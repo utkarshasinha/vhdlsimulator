@@ -1,46 +1,49 @@
 package database
 
 import (
-    "database/sql"
-    "fmt"
-    "log"
-    
-    _ "github.com/lib/pq"
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+
+	_ "github.com/lib/pq"
 )
 
 var DB *sql.DB
 
 // Connect to PostgreSQL
 func Connect() error {
-    connStr := "host=localhost port=5432 user=postgres password=postgres dbname=vhdl_platform sslmode=disable"
-    
-    var err error
-    DB, err = sql.Open("postgres", connStr)
-    if err != nil {
-        return fmt.Errorf("failed to open database: %w", err)
-    }
-    
-    if err = DB.Ping(); err != nil {
-        return fmt.Errorf("failed to ping database: %w", err)
-    }
-    
-    log.Println("✅ PostgreSQL connected successfully")
-    return nil
+	connStr := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if connStr == "" {
+		return fmt.Errorf("DATABASE_URL is not set")
+	}
+
+	var err error
+	DB, err = sql.Open("postgres", connStr)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if err = DB.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	log.Println("✅ PostgreSQL connected successfully")
+	return nil
 }
 
 // Create tables
 func InitSchema() error {
-    queries := []string{
-        `CREATE TABLE IF NOT EXISTS users (
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS users (
             id VARCHAR(36) PRIMARY KEY,
             email VARCHAR(255) UNIQUE NOT NULL,
             password_hash VARCHAR(255) NOT NULL,
             username VARCHAR(100) UNIQUE NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`,
-        
-        `DROP TABLE IF EXISTS designs CASCADE`,
-        `CREATE TABLE designs (
+		`CREATE TABLE IF NOT EXISTS designs (
             id VARCHAR(36) PRIMARY KEY,
             title VARCHAR(255) NOT NULL,
             description TEXT,
@@ -56,9 +59,7 @@ func InitSchema() error {
             likes INTEGER DEFAULT 0,
             is_public BOOLEAN DEFAULT true
         )`,
-        
-        `DROP TABLE IF EXISTS simulations CASCADE`,
-        `CREATE TABLE simulations (
+		`CREATE TABLE IF NOT EXISTS simulations (
             id VARCHAR(36) PRIMARY KEY,
             design_id VARCHAR(36) REFERENCES designs(id),
             input_code TEXT,
@@ -68,27 +69,27 @@ func InitSchema() error {
             error TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`,
-        
-        `CREATE INDEX IF NOT EXISTS idx_designs_language ON designs(language)`,
-        `CREATE INDEX IF NOT EXISTS idx_designs_public ON designs(is_public)`,
-        `CREATE INDEX IF NOT EXISTS idx_designs_user_id ON designs(user_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_simulations_design_id ON simulations(design_id)`,
-    }
-    
-    for _, query := range queries {
-        if _, err := DB.Exec(query); err != nil {
-            return fmt.Errorf("failed to execute query: %w", err)
-        }
-    }
-    
-    log.Println("✅ Database schema initialized")
-    return nil
+
+		`CREATE INDEX IF NOT EXISTS idx_designs_language ON designs(language)`,
+		`CREATE INDEX IF NOT EXISTS idx_designs_public ON designs(is_public)`,
+		`CREATE INDEX IF NOT EXISTS idx_designs_user_id ON designs(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_simulations_design_id ON simulations(design_id)`,
+	}
+
+	for _, query := range queries {
+		if _, err := DB.Exec(query); err != nil {
+			return fmt.Errorf("failed to execute query: %w", err)
+		}
+	}
+
+	log.Println("✅ Database schema initialized")
+	return nil
 }
 
 // Close database connection
 func Close() error {
-    if DB != nil {
-        return DB.Close()
-    }
-    return nil
+	if DB != nil {
+		return DB.Close()
+	}
+	return nil
 }

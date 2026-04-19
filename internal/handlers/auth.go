@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"time"
@@ -15,16 +14,12 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// JWT secret key loaded from environment.
-var jwtSecret []byte
-
-func init() {
+func getJWTSecret() ([]byte, error) {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		secret = "dev_only_insecure_change_me"
-		log.Println("⚠️ JWT_SECRET is not set; using insecure development fallback")
+		return nil, errors.New("JWT_SECRET is not set")
 	}
-	jwtSecret = []byte(secret)
+	return []byte(secret), nil
 }
 
 // Claims structure for JWT
@@ -50,6 +45,11 @@ func CheckPasswordHash(password, hash string) bool {
 
 // Generate JWT token
 func GenerateToken(userID, email, username string) (string, error) {
+	secret, err := getJWTSecret()
+	if err != nil {
+		return "", err
+	}
+
 	claims := Claims{
 		UserID:   userID,
 		Email:    email,
@@ -61,13 +61,21 @@ func GenerateToken(userID, email, username string) (string, error) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(jwtSecret)
+	return token.SignedString(secret)
 }
 
 // Verify JWT token
 func VerifyToken(tokenString string) (*Claims, error) {
+	secret, err := getJWTSecret()
+	if err != nil {
+		return nil, err
+	}
+
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		return jwtSecret, nil
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, errors.New("unexpected signing method")
+		}
+		return secret, nil
 	})
 
 	if err != nil {
@@ -127,7 +135,11 @@ func RegisterHandler(c *gin.Context) {
 	}
 
 	// Generate JWT token
-	token, _ := GenerateToken(userID, req.Email, req.Name)
+	token, err := GenerateToken(userID, req.Email, req.Name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token generation failed"})
+		return
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "User registered successfully",
@@ -172,7 +184,11 @@ func LoginHandler(c *gin.Context) {
 	}
 
 	// Generate JWT token
-	token, _ := GenerateToken(userID, req.Email, username)
+	token, err := GenerateToken(userID, req.Email, username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token generation failed"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",

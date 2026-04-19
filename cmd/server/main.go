@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"vhdl-platform/internal/database"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 )
 
 // ============== MODELS ==============
@@ -51,25 +54,46 @@ type WaveformSignal struct {
 	Data []string `json:"data,omitempty"`
 }
 
+const (
+	maxRequestBodyBytes   = 1 << 20 // 1 MiB
+	maxSimulationCodeSize = 200000
+	simulationStepTimeout = 10 * time.Second
+)
+
+type rateLimitEntry struct {
+	count     int
+	windowEnd time.Time
+}
+
+var (
+	rateLimitMu    sync.Mutex
+	rateLimitStore = map[string]rateLimitEntry{}
+)
+
 // ============== MAIN FUNCTION ==============
 
 func main() {
 	fmt.Println("🚀 VHDL Simulator Server Starting...")
 
+	if err := godotenv.Load(); err != nil {
+		log.Println("⚠️ .env file not found; using system environment variables")
+	}
+
 	// Connect to database
 	if err := database.Connect(); err != nil {
-		log.Printf("⚠️ Database connection failed: %v", err)
-		log.Println("Running with in-memory storage (data won't persist)")
-	} else {
-		if err := database.InitSchema(); err != nil {
-			log.Printf("⚠️ Schema initialization failed: %v", err)
-		} else {
-			log.Println("✅ PostgreSQL storage enabled")
-		}
+		log.Fatalf("❌ Database connection failed: %v", err)
 	}
+	if err := database.InitSchema(); err != nil {
+		log.Fatalf("❌ Schema initialization failed: %v", err)
+	}
+	log.Println("✅ PostgreSQL storage enabled")
 
 	r := gin.Default()
 	allowedOrigins := getAllowedOrigins()
+	r.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
+		c.Next()
+	})
 
 	// ✅ CORS Middleware
 	r.Use(func(c *gin.Context) {
@@ -105,16 +129,19 @@ func main() {
 	// API routes
 	api := r.Group("/api")
 	{
+		authLimiter := rateLimitMiddleware("auth", 20, time.Minute)
+		simulateLimiter := rateLimitMiddleware("simulate", 10, time.Minute)
+
 		// ============== AUTH ROUTES (No auth required) ==============
-		api.POST("/auth/register", handlers.RegisterHandler)
-		api.POST("/auth/signup", handlers.RegisterHandler) // alias for frontend compatibility
-		api.POST("/auth/login", handlers.LoginHandler)
+		api.POST("/auth/register", authLimiter, handlers.RegisterHandler)
+		api.POST("/auth/signup", authLimiter, handlers.RegisterHandler) // alias for frontend compatibility
+		api.POST("/auth/login", authLimiter, handlers.LoginHandler)
 		api.GET("/auth/me", handlers.AuthMiddleware(), handlers.GetMeHandler)
 
 		// ============== PUBLIC ROUTES (No auth required) ==============
 		api.GET("/designs", getDesigns)
 		api.GET("/designs/:id", getDesign)
-		api.POST("/simulate", simulateHandler)
+		api.POST("/simulate", simulateLimiter, simulateHandler)
 
 		// ============== PROTECTED ROUTES (Auth required) ==============
 		protected := api.Group("")
@@ -137,6 +164,37 @@ func main() {
 
 	fmt.Printf("✅ Server running on http://localhost:%s\n", port)
 	log.Fatal(r.Run(":" + port))
+}
+
+func rateLimitMiddleware(scope string, maxRequests int, window time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := scope + ":" + c.ClientIP()
+		now := time.Now()
+
+		rateLimitMu.Lock()
+		entry, ok := rateLimitStore[key]
+		if !ok || now.After(entry.windowEnd) {
+			entry = rateLimitEntry{count: 0, windowEnd: now.Add(window)}
+		}
+
+		if entry.count >= maxRequests {
+			rateLimitStore[key] = entry
+			rateLimitMu.Unlock()
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "Too many requests. Please try again later."})
+			return
+		}
+
+		entry.count++
+		rateLimitStore[key] = entry
+		rateLimitMu.Unlock()
+
+		c.Next()
+	}
+}
+
+func logAndRespondInternalError(c *gin.Context, operation string, err error) {
+	log.Printf("❌ %s failed: %v", operation, err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 }
 
 func getDatabaseStatus() string {
@@ -202,7 +260,7 @@ func getDesigns(c *gin.Context) {
 	if database.DB != nil {
 		rows, err = database.DB.Query(query, args...)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			logAndRespondInternalError(c, "get designs query", err)
 			return
 		}
 		defer rows.Close()
@@ -256,7 +314,7 @@ func getMyDesigns(c *gin.Context) {
 		userID,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logAndRespondInternalError(c, "get my designs query", err)
 		return
 	}
 	defer rows.Close()
@@ -299,7 +357,7 @@ func createDesign(c *gin.Context) {
 	)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logAndRespondInternalError(c, "create design", err)
 		return
 	}
 
@@ -339,7 +397,7 @@ func updateDesign(c *gin.Context) {
 	)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logAndRespondInternalError(c, "update design", err)
 		return
 	}
 
@@ -366,7 +424,7 @@ func deleteDesign(c *gin.Context) {
 
 	_, err = database.DB.Exec("DELETE FROM designs WHERE id = $1", id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logAndRespondInternalError(c, "delete design", err)
 		return
 	}
 
@@ -384,6 +442,14 @@ func simulateHandler(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(req.Code) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
+		return
+	}
+	if len(req.Code) > maxSimulationCodeSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code exceeds maximum allowed size"})
 		return
 	}
 
@@ -421,9 +487,11 @@ func runSimulation(code, language, entityName string) SimulationResult {
 	var output strings.Builder
 
 	if strings.ToUpper(language) == "VHDL" {
-		analyzeCmd := exec.Command("ghdl", "-a", designFile)
+		stepCtx, cancel := context.WithTimeout(context.Background(), simulationStepTimeout)
+		analyzeCmd := exec.CommandContext(stepCtx, "ghdl", "-a", designFile)
 		analyzeCmd.Dir = tempDir
 		analyzeOutput, err := analyzeCmd.CombinedOutput()
+		cancel()
 		output.WriteString("=== Analysis ===\n")
 		output.Write(analyzeOutput)
 
@@ -439,9 +507,11 @@ func runSimulation(code, language, entityName string) SimulationResult {
 			entityName = extractEntityName(code)
 		}
 
-		elaborateCmd := exec.Command("ghdl", "-e", entityName)
+		stepCtx, cancel = context.WithTimeout(context.Background(), simulationStepTimeout)
+		elaborateCmd := exec.CommandContext(stepCtx, "ghdl", "-e", entityName)
 		elaborateCmd.Dir = tempDir
 		elaborateOutput, err := elaborateCmd.CombinedOutput()
+		cancel()
 		output.WriteString("\n=== Elaboration ===\n")
 		output.Write(elaborateOutput)
 
@@ -454,9 +524,11 @@ func runSimulation(code, language, entityName string) SimulationResult {
 		}
 
 		vcdFile := filepath.Join(tempDir, "output.vcd")
-		simCmd := exec.Command("ghdl", "-r", entityName, "--vcd="+vcdFile, "--stop-time=100ns")
+		stepCtx, cancel = context.WithTimeout(context.Background(), simulationStepTimeout)
+		simCmd := exec.CommandContext(stepCtx, "ghdl", "-r", entityName, "--vcd="+vcdFile, "--stop-time=100ns")
 		simCmd.Dir = tempDir
 		simOutput, err := simCmd.CombinedOutput()
+		cancel()
 		output.WriteString("\n=== Simulation ===\n")
 		output.Write(simOutput)
 
@@ -483,9 +555,11 @@ func runSimulation(code, language, entityName string) SimulationResult {
 	} else {
 		vvpFile := filepath.Join(tempDir, "output.vvp")
 
-		compileCmd := exec.Command("iverilog", "-o", vvpFile, designFile)
+		stepCtx, cancel := context.WithTimeout(context.Background(), simulationStepTimeout)
+		compileCmd := exec.CommandContext(stepCtx, "iverilog", "-o", vvpFile, designFile)
 		compileCmd.Dir = tempDir
 		compileOutput, err := compileCmd.CombinedOutput()
+		cancel()
 		output.WriteString("=== Compilation ===\n")
 		output.Write(compileOutput)
 
@@ -497,9 +571,11 @@ func runSimulation(code, language, entityName string) SimulationResult {
 			}
 		}
 
-		simCmd := exec.Command("vvp", vvpFile)
+		stepCtx, cancel = context.WithTimeout(context.Background(), simulationStepTimeout)
+		simCmd := exec.CommandContext(stepCtx, "vvp", vvpFile)
 		simCmd.Dir = tempDir
 		simOutput, err := simCmd.CombinedOutput()
+		cancel()
 		output.WriteString("\n=== Simulation ===\n")
 		output.Write(simOutput)
 

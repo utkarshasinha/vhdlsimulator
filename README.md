@@ -2,6 +2,10 @@
 
 Go backend for authentication, design management, and VHDL simulation.
 
+## Frontend Repository
+
+- https://github.com/utkarshasinha/vhdlsimfrontend/tree/main
+
 ## Run Locally
 
 ```bash
